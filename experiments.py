@@ -1,6 +1,4 @@
 import os
-os.environ["MUJOCO_GL"] = "egl"
-os.environ["PYOPENGL_PLATFORM"] = "egl"
 import copy
 import json
 import random
@@ -19,7 +17,7 @@ from zerorl.algorithms.ppo import ppo_func, gae_compute
 from zerorl.buffer import Buffer
 from zerorl.config import AlgoConfig, TrainConfig
 from zerorl.logger import create_logger
-from zerorl.functions import (get_obs_act, vectorize_env, processing_state,
+from zerorl.functions import (get_obs_act, vectorize_env, processing_state, get_last_obs,
                               parse_dict_to_tensor, try_agent, env_step, to_env_action)
 
 
@@ -54,6 +52,8 @@ def ppo_belief_loss(agent: BaseAgent, params: dict, buffers: dict, hyper_params:
 
     logratio = new_log_probs - old_log_prob
     ratio = torch.exp(logratio)
+    approx_kl = ((ratio - 1.0) - logratio).mean()
+    clip_fraction = (ratio -1.0).abs() > clip_eps
 
     surr1 = ratio * idx_adv
     surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * idx_adv
@@ -77,7 +77,70 @@ def ppo_belief_loss(agent: BaseAgent, params: dict, buffers: dict, hyper_params:
             'policy_loss': policy_loss,
             'value_loss': value_loss,
             'belief_loss': belief_loss,
-            'entropy_loss':entropy_loss}
+            'entropy_loss':entropy_loss,
+            "old_log_prob_mean": old_log_prob.mean().detach(),
+            "new_log_prob_mean": new_log_probs.mean().detach(),
+            "logratio_mean": logratio.mean().detach(),
+            "logratio_std": logratio.std().detach(),
+            "ratio_mean": ratio.mean().detach(),
+            "ratio_std": ratio.std().detach(),
+            "approx_kl": approx_kl.detach(),
+            "clip_fraction": clip_fraction.detach(),}
+
+def ppo_loss(agent: BaseAgent, params: dict, buffers: dict, hyper_params: AlgoConfig, data: dict, idx: Tensor) -> dict[str, Tensor]:
+    states = data["state"][idx]
+    actions = data["action"][idx]
+    old_log_prob = data["log_prob"][idx]
+    old_values = data["value"][idx]
+    advantages =  data["adv_norm"][idx]
+    returns  = data["return"][idx]
+
+    value_coef = hyper_params.value_coef
+    ent_coef = hyper_params.ent_coef
+    clip_eps = hyper_params.clip_eps
+    clip_vf = getattr(hyper_params, 'clip_vf', False)
+
+    logits, new_values, new_belief = torch.func.functional_call(agent, (params, buffers), (states, actions))
+    dist = agent.build_distribution(logits) #type: ignore[operator]
+    new_log_probs, dist_entropy = eval_action(dist, actions)
+
+    idx_adv = advantages.view(-1)
+    idx_return = returns.view(-1)
+    new_values = new_values.view(-1)
+    new_belief = new_belief
+    old_values = old_values.view(-1)
+    old_log_prob = old_log_prob.view(-1)
+
+    logratio = new_log_probs - old_log_prob
+    ratio = torch.exp(logratio)
+    approx_kl = ((ratio - 1.0) - logratio).mean()
+    clip_fraction = (ratio -1.0).abs() > clip_eps
+
+    surr1 = ratio * idx_adv
+    surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * idx_adv
+    policy_loss = -torch.min(surr1, surr2).mean()
+
+    if clip_vf:
+        value_pred_clipped = old_values + (new_values - old_values).clamp(-clip_eps, clip_eps)
+        value_loss = 0.5 * torch.max((idx_return - new_values).pow(2), (value_pred_clipped - idx_return).pow(2)).mean()
+    else:
+        value_loss = 0.5 * nn.functional.mse_loss(new_values, idx_return)
+
+    entropy_loss = dist_entropy.mean()
+
+    loss = policy_loss + (value_coef * value_loss) - (ent_coef * entropy_loss)
+    return {'loss': loss,
+            'policy_loss': policy_loss,
+            'value_loss': value_loss,
+            'entropy_loss':entropy_loss,
+            "old_log_prob_mean": old_log_prob.mean().detach(),
+            "new_log_prob_mean": new_log_probs.mean().detach(),
+            "logratio_mean": logratio.mean().detach(),
+            "logratio_std": logratio.std().detach(),
+            "ratio_mean": ratio.mean().detach(),
+            "ratio_std": ratio.std().detach(),
+            "approx_kl": approx_kl.detach(),
+            "clip_fraction": clip_fraction.detach(),}
 
 ## Agent architecture
 class Agent(BaseAgent):
@@ -281,7 +344,7 @@ class EvalCurve:
                 "auc_normalized": auc_norm, "max_drawdown": compute_max_drawdown(self.mean_returns)
                 }
 
-cfg = TrainConfig(project_name="ppo-belief", model_name="belief-model", timestamp=5_000_000, num_envs=10)
+cfg = TrainConfig(project_name="ppo-belief", model_name="belief-model", timestamp=5_000_000, num_envs=14)
 algo_config = AlgoConfig(belief_coef = 0.2)
 run_seed = 89
 
@@ -306,6 +369,7 @@ def train_one_run(*, algorithm: str, agent: BaseAgent, env_id: str, cfg: TrainCo
             "terminated": (),
             "entropy": (),
             "value": (),
+            "final_value": (),
             "return": (),
             "log_prob": (),
             "advantage": (),
@@ -344,33 +408,44 @@ def train_one_run(*, algorithm: str, agent: BaseAgent, env_id: str, cfg: TrainCo
 
     for step in tqdm(range(1, cfg.num_update + 1), desc=f"{algorithm}"):
         metrics = {}
-        for _ in range(cfg.rollout_steps):
+        for i in range(cfg.rollout_steps):
             state_processed = processing_state(state, device=cfg.device)
             outputs = env_step(env, agent, state_processed)
-            outputs["terminated"] = outputs["terminated"] | outputs["truncated"]
-            outputs.pop("info")
             outputs = parse_dict_to_tensor(outputs, cfg.device)
+            info = outputs.pop("info", {})
             next_state = outputs.pop("next_state")
-            outputs["delta"] = (next_state - state_processed)
+            is_term = outputs["terminated"] > 0
+            is_trunc = outputs["truncated"] > 0
+            done = is_term | is_trunc
+            final_value = torch.zeros(cfg.num_envs, device = cfg.device)
+            outputs["delta"] = next_state - state_processed
+            if is_trunc.any():
+                last_obs = get_last_obs(info, cfg.num_envs, cfg.obs_shape, cfg.device)
+                if last_obs  is  not None:
+                    with torch.inference_mode():
+                        last_obs_processed = processing_state(last_obs, device = cfg.device)
+                        last_value = cfg.agent.get_action(last_obs_processed)["value"]
+                    final_value = torch.where(is_trunc, last_value, final_value)
+                    outputs["delta"] = last_obs_processed - state_processed
+            if i == cfg.config.rollout_steps - 1:
+                with torch.inference_mode():
+                    state_processed = processing_state(next_state, device=cfg.device)
+                    val = cfg.agent.get_action(state_processed)["value"]
+                final_value = torch.where(done, final_value, val)
+            outputs["final_value"] = final_value
             buffer.insert(**outputs)
             reward_tensor += outputs["reward"]
-            finished = outputs["terminated"] > 0
-
-            if finished.any():
-                episodic_reward.extend(reward_tensor[finished].tolist())
-                reward_tensor[finished] = 0.0
+            if done.any():
+                episodic_reward.extend(reward_tensor[done].tolist())
+                reward_tensor[done] = 0.0
             state = next_state
 
-        with torch.inference_mode():
-            state_processed = processing_state(state, device=cfg.device)
-            last_output = agent.get_action(state_processed)
-
         data = buffer.get_all()
-        gae_compute(data["reward"], data["value"], last_output["value"], data["terminated"], buffer, algo_config)
+        gae_compute(data["reward"], data["value"], data["final_value"], data["terminated"], buffer, algo_config)
         if algorithm == "belief":
             losses = ppo_func(agent, optimizer, buffer, algo_config, scheduler, ppo_loss_func=ppo_belief_loss)
         else:
-            losses = ppo_func(agent, optimizer, buffer, algo_config, scheduler)
+            losses = ppo_func(agent, optimizer, buffer, algo_config, scheduler, ppo_loss_func=ppo_loss)
 
         if episodic_reward:
             recent = episodic_reward[-10:]
@@ -408,7 +483,7 @@ def train_one_run(*, algorithm: str, agent: BaseAgent, env_id: str, cfg: TrainCo
 
 
 def make_config(algorithm: str, pair_id: int):
-    cfg = TrainConfig(project_name="ppo-belief", model_name=f"{algorithm}-pair-{pair_id}", timestamp=5_000_000, num_envs=10)
+    cfg = TrainConfig(project_name="ppo-belief", model_name=f"{algorithm}-pair-{pair_id}", timestamp=5_000_000, num_envs=14)
     return cfg
 
 
@@ -487,7 +562,7 @@ def run_pair(pair_id: int, env_id: str, master_seed: int = 2026, try_agents: boo
     return result
 
 ENV_ID = "Ant-v5"
-results = [ run_pair(i, ENV_ID, try_agents=(i == 0)) for i in range(10)]
+results = [ run_pair(i, ENV_ID, try_agents=(i == 0)) for i in range(5)]
 
 def paired_delta(results, metric,):
     deltas = []
@@ -540,5 +615,3 @@ def analyse_metric(results, metric):
 for metric in ["final_return", "auc_normalized", "max_drawdown"]:
     report = analyse_metric(results, metric)
     print(report)
-
-#try_agent("Ant-v5", agent, cfg, gif_path="belief-ant.gif")
