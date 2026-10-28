@@ -420,7 +420,7 @@ def train_one_run(*, algorithm: str, agent: BaseAgent, env_id: str, cfg: TrainCo
             final_value = torch.zeros(cfg.num_envs, device = cfg.device)
             outputs["delta"] = next_state - state_processed
             if is_trunc.any():
-                last_obs = get_last_obs(info, cfg.num_envs, cfg.obs_shape, cfg.device)
+                last_obs = get_last_obs(info, cfg.num_envs, obs_dim, cfg.device)
                 if last_obs  is  not None:
                     with torch.inference_mode():
                         last_obs_processed = processing_state(last_obs, device = cfg.device)
