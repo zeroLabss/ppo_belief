@@ -344,7 +344,8 @@ class EvalCurve:
                 }
 
 cfg = TrainConfig(project_name="ppo-belief", model_name="belief-model", timestamp=5_000_000, num_envs=14)
-algo_config = AlgoConfig(belief_coef = 0.2)
+algo_config = AlgoConfig()
+algo_config.belief_coef = 0.2
 run_seed = 89
 
 # Train  all PPO
