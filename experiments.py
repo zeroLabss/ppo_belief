@@ -424,14 +424,14 @@ def train_one_run(*, algorithm: str, agent: BaseAgent, env_id: str, cfg: TrainCo
                 if last_obs  is  not None:
                     with torch.inference_mode():
                         last_obs_processed = processing_state(last_obs, device = cfg.device)
-                        last_value = cfg.agent.get_action(last_obs_processed)["value"]
+                        last_value = agent.get_action(last_obs_processed)["value"]
                     final_value = torch.where(is_trunc, last_value, final_value)
                     trunc_delta = last_obs_processed - state_processed
                     outputs["delta"] = torch.where(is_trunc.unsqueeze(-1), trunc_delta, outputs["delta"])
             if i == cfg.rollout_steps - 1:
                 with torch.inference_mode():
                     state_processed = processing_state(next_state, device=cfg.device)
-                    val = cfg.agent.get_action(state_processed)["value"]
+                    val = agent.get_action(state_processed)["value"]
                 final_value = torch.where(done, final_value, val)
             outputs["final_value"] = final_value
             buffer.insert(**outputs)
